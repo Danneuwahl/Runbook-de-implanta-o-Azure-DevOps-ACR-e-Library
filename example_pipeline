@@ -1,0 +1,269 @@
+# Pipeline principal Lumiere usando os templates existentes no repositorio devops-templates.
+# DEV/HML/PRD selecionam seus grupos Library e seus pools de agente self-hosted.
+
+trigger:
+  branches:
+    include:
+      - dev
+      - hml
+      - main
+
+pr: none
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: devops-templates
+      ref: refs/heads/main
+
+parameters:
+  - name: forceLumierePricingApp
+    displayName: Forcar deteccao/deploy do lumiere-pricing-app
+    type: boolean
+    default: false
+  - name: forceLumierePricingApi
+    displayName: Forcar deteccao/deploy do lumiere-pricing-api
+    type: boolean
+    default: false
+
+variables:
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/dev') }}:
+      - group: lumiere-dev
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/hml') }}:
+      - group: lumiere-hml
+  - ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+      - group: lumiere-prd
+
+stages:
+  - stage: CI
+    displayName: Build das imagens
+    pool:
+      vmImage: ubuntu-latest
+    jobs:
+      - template: templates/jobs/ci/detect-changes.yml@templates
+        parameters:
+          jobName: Detect
+          apps:
+            - name: app
+              path: client
+              force: ${{ parameters.forceLumierePricingApp }}
+            - name: api
+              path: server
+              force: ${{ parameters.forceLumierePricingApi }}
+
+      - template: templates/jobs/ci/build-and-push.yml@templates
+        parameters:
+          jobName: Build_app
+          dependsOn: Detect
+          condition: "and(succeeded(), eq(dependencies.Detect.outputs['detect_app.changed'], 'true'))"
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApp)
+          dockerfile: client/Dockerfile
+          context: client
+          buildArguments: --build-arg VITE_API_URL=$(VITE_API_URL)
+          imageTag: $(IMAGE_TAG)
+          buildTag: $(Build.BuildId)
+
+      - template: templates/jobs/ci/build-and-push.yml@templates
+        parameters:
+          jobName: Build_api
+          dependsOn: Detect
+          condition: "and(succeeded(), eq(dependencies.Detect.outputs['detect_api.changed'], 'true'))"
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApi)
+          dockerfile: server/Dockerfile
+          context: server
+          buildArguments: ''
+          imageTag: $(IMAGE_TAG)
+          buildTag: $(Build.BuildId)
+
+  - stage: Deploy_Dev
+    displayName: Deploy DEV (VM)
+    dependsOn: CI
+    condition: "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'), or(eq(dependencies.CI.outputs['Detect.detect_app.changed'], 'true'), eq(dependencies.CI.outputs['Detect.detect_api.changed'], 'true')))"
+    pool:
+      name: $(agentPool)
+    jobs:
+      - template: templates/jobs/vm/prepare.yml@templates
+        parameters:
+          jobName: PrepareVM
+          deployPath: $(deployPath)
+          sourcePath: $(Build.SourcesDirectory)/.pipelines
+          # Evita apagar arquivos persistentes do host (por exemplo, dados de Certbot).
+          # Ative rsyncDelete somente se deployPath for exclusivo e totalmente gerenciado pelo repositorio.
+          rsyncDelete: false
+          envVars:
+            - IMAGE_TAG
+            - registryLoginServer
+            - repositoryApp
+            - repositoryApi
+            - COMPOSE_PROJECT_NAME
+            - ASPNETCORE_ENVIRONMENT
+            - APP_PORT
+            - API_PORT
+            - APP_DOMAIN
+            - API_DOMAIN
+            - CorsOrigins
+            - ApplyMigrations
+            - ConnectionStrings__Default
+            - Security__JwtSecret
+            - certbotEmail
+
+      - template: templates/jobs/vm/deploy.yml@templates
+        parameters:
+          jobName: Deploy_app
+          dependsOn: PrepareVM
+          condition: "and(succeeded(), eq(stageDependencies.CI.Detect.outputs['detect_app.changed'], 'true'))"
+          deployPath: $(deployPath)
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApp)
+          serviceName: app
+          imageTag: $(IMAGE_TAG)
+          domain: $(APP_DOMAIN)
+          upstreamPort: $(APP_PORT)
+          healthcheckPath: /health
+          certbotEmail: $(certbotEmail)
+
+      - template: templates/jobs/vm/deploy.yml@templates
+        parameters:
+          jobName: Deploy_api
+          dependsOn: PrepareVM
+          condition: "and(succeeded(), eq(stageDependencies.CI.Detect.outputs['detect_api.changed'], 'true'))"
+          deployPath: $(deployPath)
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApi)
+          serviceName: api
+          imageTag: $(IMAGE_TAG)
+          domain: $(API_DOMAIN)
+          upstreamPort: $(API_PORT)
+          healthcheckPath: /health
+          certbotEmail: $(certbotEmail)
+
+  - stage: Deploy_Hml
+    displayName: Deploy HML (VM)
+    dependsOn: CI
+    condition: "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/hml'), or(eq(dependencies.CI.outputs['Detect.detect_app.changed'], 'true'), eq(dependencies.CI.outputs['Detect.detect_api.changed'], 'true')))"
+    pool:
+      name: $(agentPool)
+    jobs:
+      - template: templates/jobs/vm/prepare.yml@templates
+        parameters:
+          jobName: PrepareVM
+          deployPath: $(deployPath)
+          sourcePath: $(Build.SourcesDirectory)/.pipelines
+          rsyncDelete: false
+          envVars:
+            - IMAGE_TAG
+            - registryLoginServer
+            - repositoryApp
+            - repositoryApi
+            - COMPOSE_PROJECT_NAME
+            - ASPNETCORE_ENVIRONMENT
+            - APP_PORT
+            - API_PORT
+            - APP_DOMAIN
+            - API_DOMAIN
+            - CorsOrigins
+            - ApplyMigrations
+            - ConnectionStrings__Default
+            - Security__JwtSecret
+            - certbotEmail
+
+      - template: templates/jobs/vm/deploy.yml@templates
+        parameters:
+          jobName: Deploy_app
+          dependsOn: PrepareVM
+          condition: "and(succeeded(), eq(stageDependencies.CI.Detect.outputs['detect_app.changed'], 'true'))"
+          deployPath: $(deployPath)
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApp)
+          serviceName: app
+          imageTag: $(IMAGE_TAG)
+          domain: $(APP_DOMAIN)
+          upstreamPort: $(APP_PORT)
+          healthcheckPath: /health
+          certbotEmail: $(certbotEmail)
+
+      - template: templates/jobs/vm/deploy.yml@templates
+        parameters:
+          jobName: Deploy_api
+          dependsOn: PrepareVM
+          condition: "and(succeeded(), eq(stageDependencies.CI.Detect.outputs['detect_api.changed'], 'true'))"
+          deployPath: $(deployPath)
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApi)
+          serviceName: api
+          imageTag: $(IMAGE_TAG)
+          domain: $(API_DOMAIN)
+          upstreamPort: $(API_PORT)
+          healthcheckPath: /health
+          certbotEmail: $(certbotEmail)
+
+  - stage: Deploy_Prod
+    displayName: Deploy PROD (VM)
+    dependsOn: CI
+    condition: "and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), or(eq(dependencies.CI.outputs['Detect.detect_app.changed'], 'true'), eq(dependencies.CI.outputs['Detect.detect_api.changed'], 'true')))"
+    pool:
+      name: $(agentPool)
+    jobs:
+      - template: templates/jobs/vm/prepare.yml@templates
+        parameters:
+          jobName: PrepareVM
+          deployPath: $(deployPath)
+          sourcePath: $(Build.SourcesDirectory)/.pipelines
+          rsyncDelete: false
+          envVars:
+            - IMAGE_TAG
+            - registryLoginServer
+            - repositoryApp
+            - repositoryApi
+            - COMPOSE_PROJECT_NAME
+            - ASPNETCORE_ENVIRONMENT
+            - APP_PORT
+            - API_PORT
+            - APP_DOMAIN
+            - API_DOMAIN
+            - CorsOrigins
+            - ApplyMigrations
+            - ConnectionStrings__Default
+            - Security__JwtSecret
+            - certbotEmail
+
+      - template: templates/jobs/vm/deploy.yml@templates
+        parameters:
+          jobName: Deploy_app
+          dependsOn: PrepareVM
+          condition: "and(succeeded(), eq(stageDependencies.CI.Detect.outputs['detect_app.changed'], 'true'))"
+          deployPath: $(deployPath)
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApp)
+          serviceName: app
+          imageTag: $(IMAGE_TAG)
+          domain: $(APP_DOMAIN)
+          upstreamPort: $(APP_PORT)
+          healthcheckPath: /health
+          certbotEmail: $(certbotEmail)
+
+      - template: templates/jobs/vm/deploy.yml@templates
+        parameters:
+          jobName: Deploy_api
+          dependsOn: PrepareVM
+          condition: "and(succeeded(), eq(stageDependencies.CI.Detect.outputs['detect_api.changed'], 'true'))"
+          deployPath: $(deployPath)
+          containerRegistryServiceConnection: $(containerRegistryServiceConnection)
+          registryLoginServer: $(registryLoginServer)
+          repository: $(repositoryApi)
+          serviceName: api
+          imageTag: $(IMAGE_TAG)
+          domain: $(API_DOMAIN)
+          upstreamPort: $(API_PORT)
+          healthcheckPath: /health
+          certbotEmail: $(certbotEmail)
